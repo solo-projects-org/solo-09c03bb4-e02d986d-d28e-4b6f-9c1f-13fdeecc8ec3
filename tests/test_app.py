@@ -286,3 +286,317 @@ def test_html_pages_render(client):
         assert r.status_code == 200 and "text/html" in r.headers["content-type"], path
     html = client.get("/query?date=2026-01-01").text
     assert "批次号" in html and "原行号" in html and "锚点版本" in html
+
+
+
+
+# ---------------------------------------------------------------- 逐版变更（下游同步）
+
+def get_changes(client, since=0):
+    r = client.get("/api/changes", params={"since": since})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def apply_changes(state: dict, versions: list[dict]) -> None:
+    """模拟下游：按版本顺序应用撤销/新增，维护 {reading_id: record}。"""
+    for v in versions:
+        for c in v["changes"]:
+            key = c["reading_id"]
+            if c["action"] == "retract":
+                assert state[key]["utc_time"] == c["utc_time"]      # 撤回的正是旧值
+                assert state[key]["utc_date"] == c["utc_date"]
+                state.pop(key)
+            else:
+                state[key] = c
+
+
+def sync(client, since=0) -> tuple[dict, int]:
+    body = get_changes(client, since)
+    return body, body["latest_version"]
+
+
+def test_first_version_publishes_additions(client):
+    upload(client, [(1, 100, 1.0), (1, 150, 2.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    body = get_changes(client, 0)
+    assert body["since_version"] == 0
+    assert body["latest_version"] == body["versions"][-1]["version"]
+    assert body["covers"] == "all_changes" and body["dirty"] is False
+    last = body["versions"][-1]
+    assert last["additions"] == 2 and last["retractions"] == 0
+    adds = last["changes"]
+    assert {c["action"] for c in adds} == {"add"}
+    for c in adds:
+        assert c["reason"] == "new"
+        assert c["batch_id"] == 1 and c["row_no"] in (1, 2)
+        assert c["anchor_version"] == 1
+        assert c["utc_date"] == "2026-01-01"
+        assert set(c) == {"action", "reason", "reading_id", "batch_id", "row_no",
+                          "segment", "local_seconds", "temperature",
+                          "utc_time", "utc_date", "anchor_version"}
+    # 每个已发布版本都出现在结果里
+    assert [v["version"] for v in body["versions"]] == list(
+        range(1, body["latest_version"] + 1))
+    # 稳定读数 ID 与按日查询一致
+    q = client.get("/api/readings", params={"date": "2026-01-01"}).json()
+    assert {r["reading_id"] for r in q["readings"]} == {c["reading_id"] for c in adds}
+
+
+def test_anchor_correction_cross_day_retracts_old_day(client):
+    upload(client, [(1, 100, 1.0), (1, 150, 2.0)])
+    set_anchors(client, 1, 100, "2026-01-01T23:00:00Z", 200, "2026-01-02T01:00:00Z")
+    body, v_base = sync(client)
+    state: dict = {}
+    apply_changes(state, body["versions"])
+    assert len(state) == 2
+    assert {r["utc_date"] for r in state.values()} == {"2026-01-01", "2026-01-02"}
+
+    # 整体后移一天：旧日点必须被撤回，新日点新增
+    set_anchors(client, 1, 100, "2026-01-02T23:00:00Z", 200, "2026-01-03T01:00:00Z",
+                version=1)
+    body2, v_new = sync(client, v_base)
+    assert v_new == v_base + 1
+    v2 = body2["versions"][0]
+    assert v2["retractions"] == 2 and v2["additions"] == 2
+    retracts = [c for c in v2["changes"] if c["action"] == "retract"]
+    adds = [c for c in v2["changes"] if c["action"] == "add"]
+    assert {c["utc_date"] for c in retracts} == {"2026-01-01", "2026-01-02"}
+    assert {c["utc_date"] for c in adds} == {"2026-01-02", "2026-01-03"}
+    assert {c["anchor_version"] for c in retracts} == {1}
+    assert {c["anchor_version"] for c in adds} == {2}
+    assert {c["reading_id"] for c in retracts} == {c["reading_id"] for c in adds}
+    assert {c["reason"] for c in v2["changes"]} == {"date_changed+utc_changed+anchor_version_changed"}
+
+    apply_changes(state, body2["versions"])
+    # 下游状态与平台按日查询逐日完全一致（旧日不残留）
+    for day in ("2026-01-01", "2026-01-02", "2026-01-03"):
+        got = client.get("/api/readings", params={"date": day}).json()["readings"]
+        expected = {r["reading_id"]: (r["utc_time"], r["anchor_version"]) for r in got}
+        actual = {rid: (r["utc_time"], r["anchor_version"])
+                  for rid, r in state.items() if r["utc_date"] == day}
+        assert actual == expected, day
+    assert not {r["utc_date"]: 1 for r in state.values() if r["utc_date"] == "2026-01-01"}
+
+
+def test_leaving_anchor_range_retracts(client):
+    upload(client, [(1, 100, 1.0), (1, 150, 2.0), (1, 200, 3.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    _, v_base = sync(client)
+    # 收窄范围，150/200 退出锚点范围：必须撤回，旧日桶不能残留
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 120, "2026-01-01T00:02:00Z",
+                version=1)
+    v2 = get_changes(client, v_base)["versions"][0]
+    changes = v2["changes"]
+    retracts = [c for c in changes if c["action"] == "retract"]
+    adds = [c for c in changes if c["action"] == "add"]
+    # 150/200 退出范围被撤回；100 仍在范围内但因锚点版本变化需重新发布
+    assert {c["local_seconds"] for c in retracts} == {100, 150, 200}
+    assert {c["local_seconds"]: c["reason"] for c in retracts}[150] == "out_of_anchor_range"
+    assert {c["local_seconds"]: c["reason"] for c in retracts}[200] == "out_of_anchor_range"
+    assert [(c["local_seconds"], c["utc_time"]) for c in adds] == [
+        (100, "2026-01-01T00:00:00.000Z")]
+    assert v2["additions"] == 1 and v2["retractions"] == 3
+    # 范围外的点绝不会出现在本版新增里
+    assert all(c["local_seconds"] <= 120 for c in adds)
+
+
+def test_utc_time_change_republishes_same_day(client):
+    upload(client, [(1, 150, 2.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    _, v_base = sync(client)
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:20:00Z",
+                version=1)
+    v2 = get_changes(client, v_base)["versions"][0]
+    assert [(c["action"], c["reason"]) for c in v2["changes"]] == [
+        ("retract", "utc_changed+anchor_version_changed"),
+        ("add", "utc_changed+anchor_version_changed"),
+    ]
+    assert v2["changes"][0]["utc_time"] == "2026-01-01T00:05:00.000Z"
+    assert v2["changes"][1]["utc_time"] == "2026-01-01T00:10:00.000Z"
+    assert v2["changes"][1]["anchor_version"] == 2
+
+
+def test_same_value_correction_updates_anchor_version_only_via_republish(client):
+    upload(client, [(1, 100, 1.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    _, v_base = sync(client)
+    # 等价锚点更正：UTC 不变，但锚点版本变化 → 下游仍须更新，故撤销 + 新增
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z",
+                version=1)
+    v2 = get_changes(client, v_base)["versions"][0]
+    assert [(c["action"], c["reason"]) for c in v2["changes"]] == [
+        ("retract", "anchor_version_changed"),
+        ("add", "anchor_version_changed"),
+    ]
+    assert v2["changes"][0]["utc_time"] == v2["changes"][1]["utc_time"]
+
+
+def test_empty_version_is_published_and_replayable(client):
+    upload(client, [(1, 100, 1.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    _, v_base = sync(client)
+    # 上传一批落在锚点范围外的点：重算产生一个零变更版本
+    upload(client, [(1, 900, 9.0)])
+    body = get_changes(client, v_base)
+    v_new = body["versions"][0]
+    assert v_new["version"] == v_base + 1
+    assert v_new["changes"] == []
+    assert v_new["additions"] == 0 and v_new["retractions"] == 0
+    assert body["latest_version"] == v_base + 1
+    # 同一 since 重复领取结果一致（幂等）；零变更版本也能接续
+    assert get_changes(client, v_base) == body
+    tail = get_changes(client, body["latest_version"])
+    assert tail["versions"] == [] and tail["latest_version"] == body["latest_version"]
+    # 再次上传仍产生新版本，游标继续前进
+    upload(client, [(1, 901, 9.1)])
+    assert get_changes(client, body["latest_version"])["latest_version"] == v_base + 2
+
+
+def test_bad_since_version(client):
+    upload(client, [(1, 100, 1.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    latest = get_changes(client)["latest_version"]
+    r = client.get("/api/changes", params={"since": latest + 5})
+    assert r.status_code == 409 and r.json()["code"] == "UNKNOWN_VERSION"
+    assert r.json()["current_version"] == latest
+    r = client.get("/api/changes", params={"since": -1})
+    assert r.status_code == 400 and r.json()["code"] == "BAD_VERSION"
+    r = client.get("/api/changes", params={"since": "abc"})
+    assert r.status_code == 400 and r.json()["code"] == "BAD_VALUE"
+
+
+def test_dirty_changes_only_cover_published(client, monkeypatch):
+    """未完成重算时明确标注只覆盖已发布版本，完成后重复领取可接续。"""
+    upload(client, [(1, 100, 1.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    v1 = get_changes(client)
+
+    from app import calibration
+    orig = calibration.RecalcWorker.run_until_quiet
+    monkeypatch.setattr(calibration.RecalcWorker, "run_until_quiet", lambda self: None)
+    upload(client, [(1, 150, 2.0)])          # 变更落库但未重算
+    body = get_changes(client, v1["latest_version"])
+    assert body["dirty"] is True and body["covers"] == "published_versions_only"
+    assert body["versions"] == [] and body["latest_version"] == v1["latest_version"]
+
+    monkeypatch.setattr(calibration.RecalcWorker, "run_until_quiet", orig)
+    client.post("/api/recalc")
+    body = get_changes(client, v1["latest_version"])
+    assert body["dirty"] is False and body["covers"] == "all_changes"
+    assert [c["local_seconds"] for c in body["versions"][0]["changes"]] == [150]
+    assert body["versions"][0]["version"] == v1["latest_version"] + 1
+
+
+def test_failed_recalc_publishes_no_partial_changes(client, monkeypatch):
+    upload(client, [(1, 100, 1.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    before = get_changes(client)
+
+    from app import calibration
+
+    def boom(readings, anchors):
+        raise RuntimeError("模拟计算失败")
+
+    monkeypatch.setattr(calibration, "compute_calibration", boom)
+    upload(client, [(1, 150, 2.0)])
+    after = get_changes(client)
+    assert after["versions"] == before["versions"]          # 无半组变更
+    assert after["latest_version"] == before["latest_version"]
+    assert after["dirty"] is True
+    assert after["covers"] == "published_versions_only"
+    # 已发布版本仍可重复领取，且答案不变
+    assert get_changes(client)["versions"] == before["versions"]
+
+
+def test_changes_html_page(client):
+    upload(client, [(1, 100, 1.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    r = client.get("/changes?since=0")
+    assert r.status_code == 200 and "text/html" in r.headers["content-type"]
+    for word in ("逐版撤销与新增记录", "读数 ID", "批次号", "原行号", "锚点版本",
+                 "UTC 时刻", "已同步版本"):
+        assert word in r.text
+    assert "校时版本 v" in r.text
+    # 导航入口
+    assert 'href="/changes"' in client.get("/").text
+    # 非法 since 给页面错误而非 500
+    assert "since 须为" in client.get("/changes?since=abc").text
+    assert client.get("/changes?since=999").status_code == 200
+    assert "超过当前已发布版本" in client.get("/changes?since=999").text
+
+
+def test_upgrade_existing_db_adopts_published_version(tmp_path, monkeypatch):
+    """旧库已有校时结果但无变更账本：启动时把该版登记为可领取版本。"""
+    import sqlite3
+
+    from app.main import create_app
+
+    db_path = str(tmp_path / "old.db")
+    monkeypatch.setenv("DB_PATH", db_path)
+    monkeypatch.setenv("WORKER_ENABLED", "0")
+    with TestClient(create_app()) as c:
+        upload(c, [(1, 100, 1.0), (1, 150, 2.0)])
+        set_anchors(c, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+        old_version = c.get("/api/status").json()["calc"]["version"]
+
+    # 模拟旧版本软件留下的数据库：抹掉变更账本
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM calc_changes")
+    conn.execute("DELETE FROM calc_versions")
+    conn.commit()
+    conn.close()
+
+    with TestClient(create_app()) as c:
+        body = get_changes(c)
+        assert body["latest_version"] == old_version
+        v = body["versions"][0]
+        assert v["version"] == old_version
+        assert v["additions"] == 2 and v["retractions"] == 0
+        assert {c["reason"] for c in v["changes"]} == {"adopted"}
+        q = c.get("/api/readings", params={"date": "2026-01-01"}).json()
+        assert {r["reading_id"] for r in q["readings"]} == {
+            c2["reading_id"] for c2 in v["changes"]}
+        # 再次启动不重复登记
+    with TestClient(create_app()) as c:
+        body = get_changes(c)
+        assert [v["version"] for v in body["versions"]] == [old_version]
+
+
+def test_commit_failure_rolls_back_whole_version(client, monkeypatch):
+    """换版提交中途失败：结果与变更一起回滚，旧版本完整、无半组变更。"""
+    upload(client, [(1, 100, 1.0), (1, 150, 2.0)])
+    set_anchors(client, 1, 100, "2026-01-01T00:00:00Z", 200, "2026-01-01T00:10:00Z")
+    before = get_changes(client)
+    v_before = before["latest_version"]
+
+    from app import calibration
+
+    orig = calibration._change_row
+    calls = {"n": 0}
+
+    def flaky(action, reason, version, rec):
+        calls["n"] += 1
+        if rec["local_seconds"] == 170:     # 第一条变更已写入后失败
+            raise RuntimeError("模拟提交失败")
+        return orig(action, reason, version, rec)
+
+    monkeypatch.setattr(calibration, "_change_row", flaky)
+    r = upload(client, [(1, 160, 3.0), (1, 170, 4.0)])  # 两个新增点 → 两条 add 变更
+    assert r.status_code == 200
+    calc = client.get("/api/status").json()["calc"]
+    assert calc["status"] == "failed" and calc["version"] == v_before
+    assert calls["n"] >= 2                  # 失败确实发生在写入变更的过程中
+    after = get_changes(client)
+    assert after["versions"] == before["versions"]
+    assert after["latest_version"] == v_before
+    assert after["dirty"] is True
+    q = client.get("/api/readings", params={"date": "2026-01-01"}).json()
+    assert q["count"] == 2 and q["calc_version"] == v_before
+
+    monkeypatch.setattr(calibration, "_change_row", orig)
+    client.post("/api/recalc")
+    final = get_changes(client, v_before)
+    assert final["dirty"] is False
+    assert len(final["versions"]) == 1
+    assert [c["local_seconds"] for c in final["versions"][0]["changes"]] == [160, 170]

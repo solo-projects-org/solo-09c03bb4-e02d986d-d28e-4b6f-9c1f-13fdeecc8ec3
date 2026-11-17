@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}逐版变更 - 冷链记录仪校时平台{% endblock %}
+{% block content %}
+<h2>逐版撤销与新增记录</h2>
+
+<div class="card">
+  <p class="hint">
+    输入下行仓库<b>已同步的校时版本</b>，取得此后每一已发布版本的逐条变更：
+    <b>retract</b> 撤回旧记录（按旧 UTC 日移除），<b>add</b> 新增或替换记录（写入新 UTC 日）。
+    每条变更含稳定读数 ID、批次号、原行号、UTC 时刻与锚点版本。<br>
+    同一 since 可重复领取（幂等）；零变更的版本也会返回（changes 为空），凭 latest_version 接续游标。
+  </p>
+  <form method="get" action="/changes">
+    <label>已同步版本 since</label>
+    <input type="number" name="since" min="0" required value="{{ since }}">
+    <button type="submit">领取变更</button>
+  </form>
+  {% if calc.dirty %}
+  <p class="warn">
+    注意：当前有变更尚未重算完成。本页只覆盖<b>已发布版本</b>（截至 v{{ calc.version }}）；
+    重算完成后用同一 since 重复领取即可接续，不会漏版。
+  </p>
+  {% endif %}
+  <p class="hint">
+    当前校时版本 v{{ calc.version }}，已发布版本 v{{ result.latest_version if result else calc.version }}；
+    同一结果的 JSON API：<span class="mono">/api/changes?since={{ since }}</span>
+  </p>
+</div>
+
+{% if error %}<div class="msg err">{{ error }}</div>{% endif %}
+
+{% if result %}
+<h3>自 v{{ result.since_version }} 起的变更：{{ result.versions|length }} 个版本，
+    截至 v{{ result.latest_version }}</h3>
+{% if result.dirty %}
+<p class="warn">范围：仅已发布版本；有变更尚未重算完成，完成后再按同一 since 领取即可接续。</p>
+{% endif %}
+
+{% if result.versions %}
+  {% for v in result.versions %}
+  <div class="card">
+    <h4 style="margin:0 0 6px">
+      校时版本 v{{ v.version }}
+      <span class="hint">（发布于 {{ v.created_at }}，数据代次 {{ v.state_generation }}，
+          新增 {{ v.additions }} 条 / 撤销 {{ v.retractions }} 条）</span>
+    </h4>
+    {% if v.changes %}
+    <table>
+      <tr><th>动作</th><th>原因</th><th>读数 ID</th><th>批次号</th><th>原行号</th>
+          <th>段号</th><th>本地秒数</th><th>温度</th><th>UTC 时刻</th><th>UTC 日</th>
+          <th>锚点版本</th></tr>
+      {% for c in v.changes %}
+      <tr>
+        <td>{% if c.action == 'retract' %}<span class="err">撤销</span>
+            {% else %}<span class="ok">新增</span>{% endif %}</td>
+        <td class="mono">{{ c.reason }}</td>
+        <td class="mono">{{ c.reading_id }}</td>
+        <td>{{ c.batch_id }}</td><td>{{ c.row_no }}</td><td>{{ c.segment }}</td>
+        <td class="mono">{{ c.local_seconds }}</td><td>{{ c.temperature }}</td>
+        <td class="mono">{{ c.utc_time }}</td><td class="mono">{{ c.utc_date }}</td>
+        <td>v{{ c.anchor_version }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <p class="hint">本版无变更（计算确认无差异）。</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+{% else %}
+<p class="hint">自 v{{ result.since_version }} 起没有新发布的版本。</p>
+{% endif %}
+{% endif %}
+
+{% if versions %}
+<h3>最近已发布版本</h3>
+<table>
+  <tr><th>版本</th><th>发布时间 (UTC)</th><th>数据代次</th><th>新增</th><th>撤销</th></tr>
+  {% for v in versions %}
+  <tr><td>v{{ v.version }}</td><td class="mono">{{ v.created_at }}</td>
+      <td>{{ v.state_generation }}</td><td>{{ v.additions }}</td><td>{{ v.retractions }}</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">尚无已发布版本。</p>
+{% endif %}
+{% endblock %}

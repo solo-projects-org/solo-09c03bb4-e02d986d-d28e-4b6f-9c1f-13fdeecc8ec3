@@ -190,6 +190,8 @@ def query_by_date(db: Database, date_str: str) -> dict:
         "date": day.isoformat(),
         "calc_version": info["version"],
         "dirty": info["dirty"],
+        # 有未重算变更时，本结果只是当前已发布版本（不会出现半版）
+        "covers": "published_versions_only" if info["dirty"] else "all_changes",
         "count": len(rows),
         "readings": [dict(r) for r in rows],
     }
@@ -226,3 +228,78 @@ def get_status(db: Database, cfg: Settings) -> dict:
         "batches": batches,
         "pending_count": len(pending_readings(db)),
     }
+
+
+# ---------------------------------------------------------------- 逐版变更
+
+def changes_since(db: Database, since_version: int) -> dict:
+    """领取 since_version 之后各已发布版本的撤销/新增记录。
+
+    - 每个已发布版本都出现（即使零变更），下游凭 latest_version 接续游标；
+    - 同一版本可按版本号重复领取，结果幂等；
+    - 未重算完成的变更不出现在本结果中，由 dirty 标明覆盖范围。
+    全部读取在同一把锁内完成，不会在两次查询之间混入新提交的半截数据。
+    """
+    if since_version < 0:
+        raise ServiceError("since 版本须为非负整数", code="BAD_VERSION")
+
+    def read(conn):
+        state = conn.execute("SELECT * FROM calc_state WHERE id = 1").fetchone()
+        meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
+        published_max = int(
+            conn.execute("SELECT COALESCE(MAX(version), 0) AS v FROM calc_versions")
+            .fetchone()["v"]
+        )
+        versions = [
+            dict(v) for v in conn.execute(
+                "SELECT * FROM calc_versions WHERE version > ? ORDER BY version",
+                (since_version,),
+            ).fetchall()
+        ]
+        change_rows = conn.execute(
+            "SELECT * FROM calc_changes WHERE calc_version > ? ORDER BY calc_version,"
+            " CASE action WHEN 'retract' THEN 0 ELSE 1 END, reading_id",
+            (since_version,),
+        ).fetchall()
+        return state, meta, published_max, versions, change_rows
+
+    state, meta, published_max, versions, change_rows = db.snapshot(read)
+    latest = int(state["version"])
+    dirty = int(meta.get("state_generation", "0")) != int(
+        meta.get("calibrated_generation", "-1"))
+    if since_version > published_max:
+        raise ServiceError(
+            f"since 版本 {since_version} 超过当前已发布版本 {published_max}，"
+            "请从已同步版本重新领取",
+            status=409, code="UNKNOWN_VERSION", current_version=published_max,
+        )
+
+    from .calibration import CHANGE_FIELDS
+
+    by_version: dict[int, list[dict]] = {v["version"]: [] for v in versions}
+    for c in change_rows:
+        rec = dict(c)
+        rec.pop("calc_version", None)
+        by_version[c["calc_version"]].append({k: rec[k] for k in CHANGE_FIELDS})
+    for v in versions:
+        v["changes"] = by_version[v["version"]]
+
+    return {
+        "since_version": since_version,
+        "latest_version": published_max,
+        "calc_version": latest,
+        "dirty": dirty,
+        "status": state["status"],
+        # 有未重算变更时，本结果只覆盖已发布版本；重算完成后按版本重复领取即可接续
+        "covers": "published_versions_only" if dirty else "all_changes",
+        "versions": versions,
+    }
+
+
+def list_calc_versions(db: Database) -> list[dict]:
+    return [
+        dict(v) for v in db.query(
+            "SELECT * FROM calc_versions ORDER BY version DESC LIMIT 200"
+        )
+    ]
+

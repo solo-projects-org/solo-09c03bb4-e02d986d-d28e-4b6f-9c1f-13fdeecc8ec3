@@ -19,7 +19,7 @@
     {% else %}<span class="ok">（已是最新）</span>{% endif %}
   </p>
   {% if st.calc.last_error %}<p class="err">最近错误：{{ st.calc.last_error }}</p>{% endif %}
-  <p class="hint">更新时间：{{ st.calc.updated_at }}</p>
+  <p class="hint">更新时间：{{ st.calc.updated_at }}　<a href="/changes?since=0">查看逐版变更 →</a></p>
   <form method="post" action="/recalc" style="margin:0">
     <button type="submit">立即重算</button>
   </form>

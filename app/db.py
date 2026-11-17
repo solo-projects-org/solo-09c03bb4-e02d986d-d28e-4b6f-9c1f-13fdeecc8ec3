@@ -63,6 +63,34 @@ CREATE TABLE IF NOT EXISTS calc_state (
     last_error TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+
+-- 已发布的校时版本（与 calibrated 在同一事务内写入，失败时一并回滚）
+CREATE TABLE IF NOT EXISTS calc_versions (
+    version          INTEGER PRIMARY KEY,
+    created_at       TEXT NOT NULL,
+    state_generation INTEGER NOT NULL,
+    additions        INTEGER NOT NULL,
+    retractions      INTEGER NOT NULL
+);
+
+-- 每版相对上一已发布版本的逐条变更：下游按版本领取即可增量同步。
+-- retract 行的 utc_date/utc_time/anchor_version 是「被撤回的旧记录」的值，
+-- 因此下游能准确从旧日桶移除；add 行则是新值。
+CREATE TABLE IF NOT EXISTS calc_changes (
+    calc_version   INTEGER NOT NULL REFERENCES calc_versions(version),
+    action         TEXT NOT NULL CHECK (action IN ('add', 'retract')),
+    reason         TEXT NOT NULL DEFAULT '',
+    reading_id     INTEGER NOT NULL,         -- readings.id，稳定不变
+    utc_date       TEXT NOT NULL,            -- 下行仓库按 UTC 日分桶
+    utc_time       TEXT NOT NULL,
+    anchor_version INTEGER NOT NULL,
+    batch_id       INTEGER NOT NULL,
+    row_no         INTEGER NOT NULL,
+    segment        INTEGER NOT NULL,
+    local_seconds  INTEGER NOT NULL,
+    temperature    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_calc_changes_version ON calc_changes(calc_version, action);
 """
 
 

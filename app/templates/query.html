@@ -10,7 +10,8 @@
     <button type="submit">查询</button>
   </form>
   {% if calc.dirty %}
-  <p class="warn">注意：当前有未完成的重算，查询结果可能随后变化（当前校时版本 v{{ calc.version }}）。</p>
+  <p class="warn">注意：当前有未完成的重算，查询结果可能随后变化（当前校时版本 v{{ calc.version }}）。
+    逐版变更页同样只覆盖已发布版本，重算完成后重复领取即可接续。</p>
   {% endif %}
 </div>
 

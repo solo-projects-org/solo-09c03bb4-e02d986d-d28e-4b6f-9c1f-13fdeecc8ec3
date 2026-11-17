@@ -33,6 +33,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        from .calibration import adopt_existing_version
+        adopt_existing_version(db)  # 旧库升级：已有结果登记为已发布版本
         if cfg.worker_enabled:
             worker.start()
         worker.trigger()  # 重启恢复：若有未重算的变更，启动后立即补算
@@ -214,6 +216,38 @@ def create_app() -> FastAPI:
     def api_pending():
         pend = services.pending_readings(db)
         return {"count": len(pend), "pending": pend}
+
+    @app.get("/api/versions")
+    def api_versions():
+        return {"versions": services.list_calc_versions(db)}
+
+    @app.get("/api/changes")
+    def api_changes(since: str = "0"):
+        try:
+            since_version = int(since)
+        except (TypeError, ValueError):
+            return error_json(ServiceError("since 须为非负整数版本号", code="BAD_VALUE"))
+        try:
+            return services.changes_since(db, since_version)
+        except ServiceError as exc:
+            return error_json(exc)
+
+    # ------------------------------------------------------------ 变更网页
+
+    @app.get("/changes", response_class=HTMLResponse)
+    def changes_page(request: Request, since: str = "0", msg: str = "", ok: int = 1):
+        result, error = None, None
+        try:
+            result = services.changes_since(db, int(since.strip() or "0"))
+        except ValueError:
+            error = "since 须为非负整数版本号"
+        except ServiceError as exc:
+            error = exc.message
+            if exc.current_version is not None:
+                error += f"（当前已发布版本 v{exc.current_version}）"
+        versions = services.list_calc_versions(db)
+        return render(request, "changes.html", since=since, result=result, error=error,
+                      versions=versions, calc=services.calc_info(db), msg=msg, ok=ok)
 
     return app
 
